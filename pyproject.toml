@@ -7,7 +7,7 @@ name = "mitsu-engine"
 version = "0.4.0"
 description = "A neural-network and language-model engine built around the MITSU activation: numpy with convolutions and automatic differentiation, and a PyTorch twin for GPUs"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Evan David Little" }]
