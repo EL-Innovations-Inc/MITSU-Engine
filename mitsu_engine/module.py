@@ -65,12 +65,16 @@ class Module:
         for _, child in self.children():
             yield from child.modules()
 
-    def named_parameters(self, prefix=""):
+    def named_parameters(self, prefix="", _seen=None):
+        """(name, Parameter) pairs. A Parameter shared by several modules (tied weights)
+        appears once, under the first name it is reached by."""
+        seen = set() if _seen is None else _seen
         for name, value in self.__dict__.items():
-            if isinstance(value, Parameter):
+            if isinstance(value, Parameter) and id(value) not in seen:
+                seen.add(id(value))
                 yield prefix + name, value
         for name, child in self.children():
-            yield from child.named_parameters(prefix + name + ".")
+            yield from child.named_parameters(prefix + name + ".", seen)
 
     def parameters(self):
         return [p for _, p in self.named_parameters()]
