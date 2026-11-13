@@ -1,4 +1,4 @@
-# mitsu-engine
+# MITSU Engine v0.4.0
 
 A neural-network and language-model engine built around the MITSU activation, written from
 scratch in Python with numpy as its only dependency, and a PyTorch twin of every model in
