@@ -79,7 +79,7 @@ class Trainer:
                 loss, metric, _ = self.train_step(x, y)
                 k = np.asarray(y).size
                 tl += loss * k; tm += metric * k; n += k
-            row = {"epoch": epoch, "step": self.step, "train_loss": tl / n, "train_metric": tm / n, "seconds": time.time() - t0,
+            row = {"epoch": epoch, "step": self.step, "train_loss": tl / max(n, 1), "train_metric": tm / max(n, 1), "seconds": time.time() - t0,
                    "lr": self.optimizer.lr}
             msg = f"epoch {epoch:3d}  train loss {row['train_loss']:.4f}  metric {row['train_metric']:.4f}"
             if val_loader is not None:
@@ -89,7 +89,7 @@ class Trainer:
                 if val["loss"] < best - 1e-9:
                     best, bad = val["loss"], 0
                     if checkpoint:
-                        save_checkpoint(checkpoint, self.model, meta={"epoch": epoch, "val_loss": best})
+                        self.save_model(checkpoint, {"epoch": epoch, "val_loss": best})
                 else:
                     bad += 1
             self.history.append(row)
@@ -98,8 +98,16 @@ class Trainer:
                 self.log(f"stopping early: no improvement for {patience} epochs")
                 break
         if checkpoint and val_loader is not None and best < float("inf"):
-            load_checkpoint(checkpoint, self.model)
+            self.load_model(checkpoint)
         return self.history
+
+    def save_model(self, path, meta=None):
+        """Write the model's weights (no optimiser state) to a checkpoint."""
+        save_checkpoint(path, self.model, meta=meta)
+
+    def load_model(self, path):
+        """Load weights written by save_model. Returns the checkpoint's metadata."""
+        return load_checkpoint(path, self.model)
 
     # ---- step-based training ----------------------------------------------
     def fit_steps(self, next_batch, steps, eval_fn=None, eval_every=None, log_every=None, accumulate=1,

@@ -1,9 +1,10 @@
 """mitsu_engine — a neural-network engine built around the MITSU activation.
 
-numpy only. Every layer has a hand-written backward pass, checked against finite
-differences. See README.md for a tour. The optional sub-package `mitsu_engine.twin` holds a
-PyTorch copy of MitsuLM that is tested to reproduce this engine; it is imported only on
-request, so nothing here needs PyTorch.
+numpy only. Every built-in layer has a hand-written backward pass, checked against finite
+differences; `autograd` derives the backward pass for layers of your own. See README.md for
+a tour. The optional sub-package `mitsu_engine.twin` builds PyTorch copies of the models,
+for GPUs, that are tested to reproduce this engine; it is imported only on request, so
+nothing here needs PyTorch.
 
     import mitsu_engine as me
     model = me.DeepMitsuNet(d_in=784, d_out=10, width=256, depth=16)
@@ -16,7 +17,10 @@ from .module import Parameter, Module, Sequential, Residual, Identity
 from .layers import Linear, Embedding, TiedHead, LayerNorm, RMSNorm, Dropout, Flatten
 from .activations import MITSU, ReLU, GELU, SiLU, Tanh, Activation, get_activation
 from .blocks import FeedForward, MitsuGLU, MultiHeadSelfAttention, TransformerBlock, mitsu_block, residual_branch
-from .models import MLP, DeepMitsuNet, MitsuGPT, MitsuLM, LMConfig, sample_token
+from .conv import Conv2d, MaxPool2d, AvgPool2d, GlobalAvgPool2d, GroupNorm
+from .models import MLP, DeepMitsuNet, MitsuConvNet, MitsuGPT, MitsuLM, LMConfig, sample_token
+from . import autograd
+from .autograd import Tensor, AutoModule
 from .losses import CrossEntropy, MSE, accuracy
 from .optim import SGD, Adam, AdamW, clip_grad_norm, grad_norm, ConstantLR, WarmupCosine, StepLR
 from .data import DataLoader, train_val_split, Standardizer, CharTokenizer, TextBatcher, make_spirals
@@ -27,4 +31,4 @@ from .trainer import Trainer, evaluate_lm
 from .tokenizer import BPETokenizer
 from .corpus import prepare_corpus, load_corpus, open_tokens, write_tokens, encode_file, iter_text, token_dtype
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

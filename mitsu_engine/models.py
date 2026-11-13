@@ -2,6 +2,7 @@
 
     MLP            plain Linear -> activation stack. For shallow networks (up to about 8 layers).
     DeepMitsuNet   normalised residual blocks. Trains at any depth.
+    MitsuConvNet   residual convolutional network for images.
     MitsuGPT       small decoder-only transformer: learned positions, LayerNorm.
     MitsuLM        the language-model architecture: rotary positions, RMSNorm, MitsuGLU,
                    tied embeddings, cached generation. Described by an LMConfig.
@@ -12,6 +13,8 @@ import numpy as np
 from . import config, functional as F, init as initlib
 from .module import Module, Sequential, Parameter
 from .layers import Linear, Embedding, LayerNorm, RMSNorm, TiedHead, Dropout
+from .conv import Conv2d, GroupNorm, GlobalAvgPool2d
+from .module import Residual
 from .activations import get_activation
 from .blocks import mitsu_block, TransformerBlock
 from .io import save_checkpoint, load_checkpoint, read_meta
@@ -72,6 +75,48 @@ class DeepMitsuNet(Module):
 
     def extra_repr(self):
         return f"d_in={self.d_in}, d_out={self.d_out}, width={self.width}, depth={self.depth}"
+
+
+class MitsuConvNet(Sequential):
+    """Residual convolutional network for images (batch, channels, height, width):
+
+        stem   Conv 3x3 (in_channels -> channels[0])
+        stage  blocks x  [ x + Conv3x3(act(Conv3x3(GroupNorm(x)))) ]
+               between stages: GroupNorm -> Conv 3x3 with stride 2, to the next width
+        head   GroupNorm -> global average pool -> Linear(channels[-1], n_classes)
+
+    The branches follow the engine's rule for residual networks: the first convolution
+    keeps a normalised input at unit variance, and the last one is scaled so the branch
+    adds variance branch_scale^2 / (number of blocks). Group normalisation has no batch
+    statistics, so the network behaves the same in training and evaluation.
+
+    channels   width of each stage, for example (16, 32, 64); the image is halved between stages
+    blocks     residual blocks per stage
+    groups     normalisation groups (falls back to 1 where it does not divide the width)
+    """
+
+    def __init__(self, in_channels, n_classes, channels=(16, 32, 64), blocks=2, groups=8, activation="mitsu", dropout=0.0,
+                 branch_scale=1.0, rng=None):
+        rng = config.get_rng(rng)
+        self.in_channels, self.n_classes, self.channels, self.blocks = in_channels, n_classes, tuple(channels), blocks
+        scale = branch_scale / math.sqrt(max(len(channels) * blocks, 1))
+        norm = lambda c: GroupNorm(groups if c % groups == 0 else 1, c)
+        layers = [Conv2d(in_channels, channels[0], 3, padding=1, rng=rng)]
+        for i, c in enumerate(channels):
+            if i > 0:
+                layers += [norm(channels[i - 1]), Conv2d(channels[i - 1], c, 3, stride=2, padding=1, rng=rng)]
+            for _ in range(blocks):
+                act = get_activation(activation if isinstance(activation, str) else type(activation))
+                branch = [norm(c), Conv2d(c, c, 3, padding=1, rng=rng), act,
+                          Conv2d(c, c, 3, padding=1, init=initlib.activation_gain(act), scale=scale, rng=rng)]
+                if dropout > 0:
+                    branch.append(Dropout(dropout, rng=rng))
+                layers.append(Residual(Sequential(*branch)))
+        layers += [norm(channels[-1]), GlobalAvgPool2d(), Linear(channels[-1], n_classes, init="lecun", rng=rng)]
+        super().__init__(*layers)
+
+    def extra_repr(self):
+        return f"in_channels={self.in_channels}, n_classes={self.n_classes}, channels={self.channels}, blocks={self.blocks}"
 
 
 class MitsuGPT(Module):

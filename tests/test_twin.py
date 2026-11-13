@@ -437,8 +437,10 @@ def test_trainer_rejects_unknown_modes():
     _, net = pair(np.float32)
     with pytest.raises(ValueError):
         twin.TorchTrainer(net, twin.EngineAdamW(net), amp="fp8")
-    with pytest.raises(NotImplementedError):
-        twin.TorchTrainer(net, twin.EngineAdamW(net), log=None).fit([])
+    with pytest.raises(ValueError):
+        twin.TorchTrainer(net, twin.EngineAdamW(net), loss="hinge")
+    with pytest.raises(ValueError):
+        twin.TorchTrainer(net, twin.EngineAdamW(net), metric="f1")
     with pytest.raises(TypeError):
         twin.TorchTrainer(net, torch.optim.AdamW(net.parameters()))
 

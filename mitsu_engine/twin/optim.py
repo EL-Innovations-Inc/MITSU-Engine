@@ -8,25 +8,26 @@ training trajectory and optimiser state can be saved by one and continued by the
 import math
 import numpy as np
 import torch
-from .convert import _named, is_linear_weight, to_engine_array, to_torch_array
+from .convert import layout, _to_engine, _to_torch
 
 
 class EngineAdamW(torch.optim.Optimizer):
-    """AdamW with the engine's update rule, for a TorchMitsuLM.
+    """AdamW with the engine's update rule, for a TorchMitsuLM or any model from twin.to_torch.
 
         m <- b1 m + (1 - b1) g
         v <- b2 v + (1 - b2) g^2
         p <- p - lr * weight_decay * p                     weight matrices only
         p <- p - lr * sqrt(1 - b2^t) / (1 - b1^t) * m / (sqrt(v) + eps)
 
-    Weight decay applies to the weight matrices and not to the token table or the norm
-    gains, as in the engine. `lr` can be read and assigned, which is how schedules drive it.
+    Weight decay applies to the parameters the engine marks for it (weight matrices and
+    convolution kernels, not embeddings, biases or norm gains). `lr` can be read and
+    assigned, which is how schedules drive it.
     """
 
     def __init__(self, model, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
-        self._names = _named(model)                       # engine order
-        self._decay = {id(p): is_linear_weight(n) for n, p in self._names.items()}
-        super().__init__(list(self._names.values()), dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
+        self._layout = list(layout(model))                # engine order: (name, parameter, transposed, decay)
+        self._decay = {id(p): decay for _, p, _, decay in self._layout}
+        super().__init__([p for _, p, _, _ in self._layout], dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay))
         self.steps = 0
 
     @property
@@ -73,18 +74,18 @@ class EngineAdamW(torch.optim.Optimizer):
         counter and one first- and second-moment array per parameter, in the engine's order
         and layout."""
         state = {"steps": np.array(self.steps)}
-        for i, (name, p) in enumerate(self._names.items()):
+        for i, (_, p, transposed, _) in enumerate(self._layout):
             m, v = self._moments(p)
-            state[f"m.{i}"], state[f"v.{i}"] = to_engine_array(name, m), to_engine_array(name, v)
+            state[f"m.{i}"], state[f"v.{i}"] = _to_engine(m, transposed), _to_engine(v, transposed)
         return state
 
     @torch.no_grad()
     def load_engine_state(self, state):
         """Restore a state saved by this class or by the engine's AdamW."""
         self.steps = int(state["steps"])
-        for i, (name, p) in enumerate(self._names.items()):
+        for i, (name, p, transposed, _) in enumerate(self._layout):
             for key, buf in zip((f"m.{i}", f"v.{i}"), self._moments(p)):
-                value = to_torch_array(name, state[key])
+                value = _to_torch(state[key], transposed)
                 if value.shape != tuple(buf.shape):
                     raise ValueError(f"optimiser state {key} ({name}) has shape {value.shape}, expected {tuple(buf.shape)}")
                 buf.copy_(torch.from_numpy(value).to(device=buf.device, dtype=buf.dtype))

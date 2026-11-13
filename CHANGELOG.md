@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.0 — convolutions, automatic differentiation, a GPU path for every model
+
+- **Automatic differentiation** (`mitsu_engine.autograd`). A `Tensor` with reverse-mode
+  differentiation over numpy: arithmetic with broadcasting, tensor exponents, matrix
+  products, the usual functions and reductions, indexing, softmax and cross-entropy,
+  convolution and pooling. `AutoModule` turns a `compute(x)` written with tensor operations
+  into an ordinary layer; engine Parameters are used directly in the expressions, and
+  hand-written layers can be called inside them. Every operation is checked against finite
+  differences, and the whole of `MitsuLM` differentiated automatically matches its
+  hand-written backward pass to 1e-11.
+- **Convolutions** (`mitsu_engine.conv`). `Conv2d`, `MaxPool2d`, `AvgPool2d`,
+  `GlobalAvgPool2d`, `GroupNorm`, and `MitsuConvNet`, a residual convolutional network.
+  `load_mnist(flatten=False)` returns images. 99.35% on MNIST in two epochs with 121,386
+  parameters.
+- **Every model has a PyTorch twin.** `twin.to_torch(model, device)` mirrors any engine
+  model; `twin.compare_models` and `twin.check_models` measure it against the engine
+  (5e-15 or less in float64 for every kind of network). `TorchTrainer` now takes any loss
+  and metric and inherits `fit`, early stopping and best-model checkpoints from the
+  engine's trainer. `twin.register` names the PyTorch form of a layer of your own.
+- **`python -m mitsu_engine gpu-check`.** Twelve checks of the twin against the numpy
+  engine on a given device, each isolated, with a JSON report.
+- **Device-discipline tests that need no GPU.** Every network's forward pass, backward
+  pass, optimiser step and generation cache run on PyTorch's `meta` device, which rejects
+  any tensor left on the CPU.
+- Fixed: tied embeddings in `TorchMitsuLM` relied on two modules sharing one Parameter
+  object, which a device move may replace. The output layer now reads the table from the
+  embedding, so the tie cannot come apart. Found by the test above.
+- Changed: `docs/TWIN.md` is now `docs/GPU.md`. `Trainer` gained `save_model` /
+  `load_model`. A PyTorch `state_dict` of a tied `TorchMitsuLM` no longer has `head.weight`
+  (engine checkpoints never had it and are unaffected).
+- 239 tests without PyTorch (99 new), 330 with it (140 new), two new examples.
+
+Not done: nothing has been run on a GPU; no GPU was available. `gpu-check` is the
+verification to run on one.
+
 ## 0.3.0 — language-model stage 2: the PyTorch twin
 
 `mitsu_engine.twin`: the same language model in PyTorch, tested to reproduce the numpy

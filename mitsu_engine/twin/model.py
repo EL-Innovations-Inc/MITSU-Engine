@@ -11,8 +11,8 @@ from torch.nn import functional as F
 from .. import config as engine_config
 from ..io import read_checkpoint, write_checkpoint
 from ..models import MitsuLM, LMConfig, sample_token
-from .convert import engine_state, load_engine_state
-from .modules import Block, RMSNorm
+from .convert import engine_state, load_engine_state, lm_layout
+from .modules import Block, RMSNorm, TiedHead
 
 
 def _torch_dtype(array):
@@ -47,13 +47,16 @@ class TorchMitsuLM(nn.Module):
         self.blocks = nn.ModuleList([Block(cfg.d_model, cfg.n_heads, hidden, cfg.gate_mult, cfg.dropout, cfg.rope_base, cfg.context, glu)
                                      for _ in range(cfg.n_layers)])
         self.norm = RMSNorm(cfg.d_model)
-        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        if cfg.tie_embeddings:
-            self.head.weight = self.tok.weight
+        self.head = TiedHead(self.tok) if cfg.tie_embeddings else nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if init:
             state = MitsuLM(cfg, rng=rng).state_dict()
             self.to(_torch_dtype(state["tok.weight"]))          # adopt the engine's precision (me.set_dtype)
             load_engine_state(self, state)
+
+    @property
+    def engine_layout(self):
+        """[(name, parameter, transposed, decay)] in the engine's parameter order."""
+        return lm_layout(self)
 
     # ---- training path --------------------------------------------------
     def forward(self, idx):

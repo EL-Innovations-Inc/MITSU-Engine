@@ -63,19 +63,40 @@ class RMSNorm(nn.Module):
         return (w * inv).to(x.dtype) * self.gain
 
 
+class TiedHead(nn.Module):
+    """Output layer that reuses an Embedding's table: logits = x E^T.
+
+    It holds the Embedding module, not a copy of its Parameter, and owns no parameter of
+    its own. Sharing one Parameter object between two modules also ties them, but some
+    device moves replace Parameter objects and silently untie them; looking the table up
+    through the Embedding on every call cannot come apart."""
+
+    def __init__(self, embedding):
+        super().__init__()
+        self._embedding = (embedding,)             # in a tuple so it is not registered a second time
+
+    @property
+    def weight(self):
+        return self._embedding[0].weight
+
+    def forward(self, x):
+        return F.linear(x, self.weight)
+
+
 class Attention(nn.Module):
-    """Causal multi-head self-attention with rotary positions, no bias.
+    """Multi-head self-attention. The defaults are the language model's: causal, rotary
+    positions, no bias. causal, rope and bias mirror the engine's MultiHeadSelfAttention.
 
     forward(x) is the training path. step(x, cache) is the incremental path used for
     generation: it processes only the new tokens and reuses earlier keys and values."""
 
-    def __init__(self, dim, n_heads, rope_base=10000.0, context=256):
+    def __init__(self, dim, n_heads, rope_base=10000.0, context=256, causal=True, rope=True, bias=False):
         super().__init__()
-        if dim % n_heads or (dim // n_heads) % 2:
-            raise ValueError("dim / n_heads must be an even whole number")
-        self.dim, self.n_heads, self.rope_base, self.context = dim, n_heads, rope_base, context
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.proj = nn.Linear(dim, dim, bias=False)
+        if dim % n_heads or (rope and (dim // n_heads) % 2):
+            raise ValueError("dim must be divisible by n_heads, and dim / n_heads must be even for rotary positions")
+        self.dim, self.n_heads, self.rope_base, self.context, self.causal, self.rope = dim, n_heads, rope_base, context, causal, rope
+        self.qkv = nn.Linear(dim, 3 * dim, bias=bias)
+        self.proj = nn.Linear(dim, dim, bias=bias)
         self._tables = {}          # (device, dtype) -> (cos, sin); derived data, not saved
 
     def _rope(self, length, offset, like):
@@ -95,13 +116,15 @@ class Attention(nn.Module):
     def _qkv(self, x, offset):
         B, T, D = x.shape
         q, k, v = self.qkv(x).view(B, T, 3, self.n_heads, D // self.n_heads).permute(2, 0, 3, 1, 4)   # each (B, H, T, D/H)
+        if not self.rope:
+            return q, k, v
         cos, sin = self._rope(T, offset, x)
         return rope_rotate(q, cos, sin), rope_rotate(k, cos, sin), v
 
     def forward(self, x):
         B, T, D = x.shape
         q, k, v = self._qkv(x, 0)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         return self.proj(y.transpose(1, 2).reshape(B, T, D))
 
     @torch.no_grad()
@@ -114,7 +137,7 @@ class Attention(nn.Module):
         if past:
             k, v = torch.cat((cache[0], k), dim=2), torch.cat((cache[1], v), dim=2)
         mask = None
-        if T > 1:      # new token i sits at position past + i and may see positions <= past + i
+        if self.causal and T > 1:      # new token i sits at position past + i and may see positions <= past + i
             mask = torch.ones(T, past + T, dtype=torch.bool, device=x.device).tril(past)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.proj(y.transpose(1, 2).reshape(B, T, D)), (k, v)

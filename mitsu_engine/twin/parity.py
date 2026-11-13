@@ -11,9 +11,9 @@ PyTorch build reproduce the reference.
 import numpy as np
 import torch
 from .. import config as engine_config
-from ..losses import CrossEntropy
+from ..losses import CrossEntropy, MSE
 from ..models import MitsuLM, LMConfig
-from .convert import _named, to_engine_array
+from .convert import layout, _to_engine
 from .model import TorchMitsuLM
 
 # Largest differences accepted by `check`. The float64 limits are close to rounding error;
@@ -75,9 +75,9 @@ def compare(engine_model, torch_model, idx=None, targets=None, batch=2, tokens=3
         loss.backward()
         out = {"logits": float(np.abs(_f64(logits) - ref_logits).max()),
                "loss": abs(loss.item() - ref_loss), "gradient": 0.0, "gradient_worst": None}
-        for name, p in _named(torch_model).items():
+        for name, p, transposed, _ in layout(torch_model):
             ref = ref_grads[name]
-            err = float(np.abs(to_engine_array(name, p.grad).astype(np.float64) - ref).max() / max(np.abs(ref).max(), 1e-30))
+            err = float(np.abs(_to_engine(p.grad, transposed).astype(np.float64) - ref).max() / max(np.abs(ref).max(), 1e-30))
             if err >= out["gradient"]:
                 out["gradient"], out["gradient_worst"] = err, name
         torch_model.zero_grad(set_to_none=True)
@@ -102,6 +102,117 @@ def compare(engine_model, torch_model, idx=None, targets=None, batch=2, tokens=3
     finally:
         engine_model.train(modes[0]), torch_model.train(modes[1])
     return out
+
+
+def compare_models(engine_model, torch_model, x, y=None, loss="cross_entropy", seed=0):
+    """Run any engine model and its twin.to_torch copy on the same input and return the
+    largest differences.
+
+    output           largest absolute difference between the two outputs
+    loss             absolute difference between the two losses
+    gradient         largest parameter-gradient difference (engine backward against PyTorch
+                     autograd), relative to that parameter's largest entry; `gradient_worst`
+                     names the parameter
+    input_gradient   the same for the gradient with respect to a floating-point input
+
+    With targets `y` the loss is "cross_entropy" or "mse". Without, the outputs are reduced
+    to a number with a fixed random weighting, which exercises every output. Both models
+    are compared in evaluation mode and returned to their previous mode."""
+    x = np.asarray(x)
+    first = next(torch_model.parameters())
+    device, dtype = first.device, first.dtype
+    is_float = np.issubdtype(x.dtype, np.floating)
+    t_x = torch.from_numpy(np.ascontiguousarray(x)).to(device=device, dtype=dtype if is_float else torch.long)
+    t_x.requires_grad_(is_float)
+    modes = engine_model.training, torch_model.training
+    engine_model.eval(), torch_model.eval()
+    try:
+        engine_model.zero_grad()
+        ref_out = engine_model(x.astype(first.detach().cpu().numpy().dtype) if is_float else x)
+        out = torch_model(t_x)
+        if y is None:
+            weights = np.random.default_rng(seed).standard_normal(ref_out.shape).astype(ref_out.dtype)
+            ref_loss, grad = float((ref_out * weights).sum()), weights
+            t_loss = (out * torch.from_numpy(weights).to(device=device, dtype=out.dtype)).sum()
+        else:
+            y = np.asarray(y)
+            ref_loss, grad = (CrossEntropy() if loss == "cross_entropy" else MSE())(ref_out, y)
+            t_y = torch.from_numpy(np.ascontiguousarray(y)).to(device)
+            t_loss = (torch.nn.functional.cross_entropy(out.reshape(-1, out.shape[-1]), t_y.reshape(-1).long()) if loss == "cross_entropy"
+                      else torch.nn.functional.mse_loss(out, t_y.to(out.dtype)))
+        ref_gx = engine_model.backward(grad)
+        torch_model.zero_grad(set_to_none=True)
+        t_loss.backward()
+        result = {"output": float(np.abs(_f64(out) - ref_out).max()), "loss": abs(t_loss.item() - ref_loss), "gradient": 0.0, "gradient_worst": None}
+        refs = dict(engine_model.named_parameters())
+        for name, p, transposed, _ in layout(torch_model):
+            ref = refs[name].grad.astype(np.float64)
+            got = np.zeros_like(ref) if p.grad is None else _to_engine(p.grad, transposed).astype(np.float64)
+            err = float(np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-30))
+            if err >= result["gradient"]:
+                result["gradient"], result["gradient_worst"] = err, name
+        if is_float and ref_gx is not None:
+            result["input_gradient"] = float(np.abs(_f64(t_x.grad) - ref_gx).max() / max(np.abs(ref_gx).max(), 1e-30))
+        engine_model.zero_grad()
+        torch_model.zero_grad(set_to_none=True)
+    finally:
+        engine_model.train(modes[0]), torch_model.train(modes[1])
+    return result
+
+
+def model_zoo(dtype=np.float64, seed=0):
+    """One small instance of every kind of network in the engine, with an input for each:
+    [(label, engine model, input array)]. Used to check that each one has a faithful twin."""
+    from .. import (MLP, DeepMitsuNet, MitsuConvNet, MitsuGPT, Sequential, Residual, Linear, LayerNorm, Flatten, Conv2d, MaxPool2d,
+                    AvgPool2d, GroupNorm, MultiHeadSelfAttention, TransformerBlock, FeedForward, MitsuGLU, MITSU, GELU, SiLU, Tanh, ReLU)
+    previous = engine_config.get_dtype()
+    engine_config.set_dtype(dtype)
+    try:
+        r = np.random.default_rng(seed)
+        f = lambda *shape: r.standard_normal(shape).astype(dtype)
+        zoo = [
+            ("MLP", MLP([12, 16, 16, 5], rng=1), f(4, 12)),
+            ("DeepMitsuNet, mlp blocks", DeepMitsuNet(12, 5, width=16, depth=4, rng=2), f(4, 12)),
+            ("DeepMitsuNet, MitsuGLU blocks", DeepMitsuNet(12, 5, width=18, depth=3, block="glu", rng=3), f(4, 12)),
+            ("MitsuConvNet", MitsuConvNet(2, 5, channels=(8, 16), blocks=2, groups=4, rng=4), f(3, 2, 12, 12)),
+            ("MitsuGPT", MitsuGPT(31, context=10, d_model=16, n_layers=2, n_heads=2, rng=5), r.integers(0, 31, (3, 10))),
+            ("MitsuGPT, mlp feed-forward", MitsuGPT(31, context=10, d_model=16, n_layers=1, n_heads=4, ffn="mlp", rng=6), r.integers(0, 31, (3, 7))),
+            ("every layer in one stack", Sequential(
+                Conv2d(2, 4, 3, stride=2, padding=1, bias=False, rng=7), GroupNorm(1, 4), SiLU(), MaxPool2d(2), AvgPool2d(3, 1),
+                Flatten(), Linear(16, 12, rng=7), LayerNorm(12), GELU(), Residual(FeedForward(12, 20, activation="tanh", rng=7)),
+                MitsuGLU(12, 10, bias=True, c=1.4, gate_mult=2.0, rng=7), ReLU(), Linear(12, 6, bias=False, rng=7), MITSU(c=0.8, gain=3.0)), f(3, 2, 16, 16)),
+            ("attention without mask, with bias", Sequential(
+                MultiHeadSelfAttention(12, 3, causal=False, bias=True, rng=8), TransformerBlock(12, 2, ffn="mlp", activation="gelu", causal=False, rng=8),
+                TransformerBlock(12, 2, norm="rms", rope=True, rng=8), Tanh()), f(2, 6, 12)),
+        ]
+        for _, model, _ in zoo:                                       # move gains and biases off their defaults
+            for p in model.parameters():
+                if not p.decay:
+                    p.data += 0.2 * r.standard_normal(p.data.shape)
+    finally:
+        engine_config.set_dtype(previous)
+    return zoo
+
+
+MODEL_TOLERANCE = {"float64": {"output": 1e-10, "gradient": 1e-9, "input_gradient": 1e-9},
+                   "float32": {"output": 5e-4, "gradient": 5e-3, "input_gradient": 5e-3}}
+
+
+def check_models(device="cpu"):
+    """Mirror every network in `model_zoo` on `device` and compare it with the engine, in
+    float64 and float32. Returns (ok, rows)."""
+    from .mirror import to_torch
+    device = torch.device(device)
+    rows = []
+    for name, np_dtype in (("float64", np.float64), ("float32", np.float32)):
+        if name == "float64" and device.type == "mps":
+            continue
+        for label, model, x in model_zoo(np_dtype):
+            row = {"model": label, "precision": name, **compare_models(model, to_torch(model, device=device), x)}
+            limit = MODEL_TOLERANCE[name]
+            row["ok"] = all(row[k] <= limit[k] for k in limit if k in row)
+            rows.append(row)
+    return all(r["ok"] for r in rows), rows
 
 
 def _build(cfg, params, dtype):

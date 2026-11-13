@@ -48,6 +48,9 @@ class Module:
         raise NotImplementedError
 
     def __call__(self, x):
+        if hasattr(x, "_backward"):                 # an autograd Tensor: record this layer in its graph
+            from .autograd import call_module
+            return call_module(self, x)
         return self.forward(x)
 
     # ---- tree walking -------------------------------------------------

@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mitsu-engine"
-version = "0.3.0"
-description = "A neural-network and language-model engine built around the MITSU activation: a numpy reference and a verified PyTorch twin"
+version = "0.4.0"
+description = "A neural-network and language-model engine built around the MITSU activation: numpy with convolutions and automatic differentiation, and a PyTorch twin for GPUs"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Evan David Little" }]
 dependencies = ["numpy>=1.24"]
-keywords = ["neural-network", "activation-function", "numpy", "pytorch", "deep-learning", "transformer", "language-model", "tokenizer"]
+keywords = ["neural-network", "activation-function", "numpy", "pytorch", "deep-learning", "transformer", "language-model", "tokenizer", "convolution", "automatic-differentiation", "gpu"]
 classifiers = ["Programming Language :: Python :: 3", "Topic :: Scientific/Engineering :: Artificial Intelligence"]
 
 [project.scripts]

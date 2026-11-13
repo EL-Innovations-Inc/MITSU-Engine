@@ -9,6 +9,7 @@
 With PyTorch installed, the same commands run on the PyTorch twin, and `parity` measures
 how closely the twin reproduces the numpy engine on a given machine:
 
+    python -m mitsu_engine gpu-check --device cuda --out gpu_report.json
     python -m mitsu_engine parity   --device cuda
     python -m mitsu_engine train    --data data/book --out runs/book --backend torch --device cuda --amp bf16
     python -m mitsu_engine generate --run runs/book --backend torch --device cuda
@@ -46,6 +47,13 @@ def cmd_parity(a):
     ok, rows = twin.check(run=run, device=device, batch=a.batch, tokens=a.tokens, seed=a.seed, cfg=cfg, amp=tuple(a.amp))
     print(twin.format_report(rows, device))
     print("\nPASS: the PyTorch twin reproduces the numpy engine here." if ok else "\nFAIL: at least one difference is outside the tolerance.")
+    sys.exit(0 if ok else 1)
+
+
+def cmd_gpu_check(a):
+    twin, torch, device = _twin(a.device)
+    from .twin import gpucheck
+    ok, _ = gpucheck.run(device, amp=tuple(a.amp), compile=a.compile, speed=not a.no_speed, out=a.out)
     sys.exit(0 if ok else 1)
 
 
@@ -209,6 +217,14 @@ def build_parser():
     s.add_argument("--heads", type=int, default=4)
     s.add_argument("--seed", type=int, default=0)
     s.set_defaults(func=cmd_parity)
+
+    s = sub.add_parser("gpu-check", help="run every twin check on a device and print PASS or FAIL (needs PyTorch)")
+    s.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:1, mps")
+    s.add_argument("--amp", nargs="*", default=["bf16", "fp16"], choices=["bf16", "fp16"], help="mixed-precision modes to test")
+    s.add_argument("--compile", action="store_true", help="also test torch.compile")
+    s.add_argument("--no-speed", action="store_true", help="skip the timing section")
+    s.add_argument("--out", default=None, help="write the full report to this JSON file")
+    s.set_defaults(func=cmd_gpu_check)
     return p
 
 

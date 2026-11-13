@@ -1,24 +1,25 @@
 # mitsu-engine
 
 A neural-network and language-model engine built around the MITSU activation, written from
-scratch in Python with numpy as its only dependency, and a PyTorch twin of its language
-model that is tested to reproduce it.
+scratch in Python with numpy as its only dependency, and a PyTorch twin of every model in
+it, for GPUs, that is tested to reproduce it.
 
 ```
 MITSU(u) = s (s − 1) / (s + 2),   s = softplus(u)
 ```
 
 It is a small, complete framework: layers with hand-written backpropagation, MITSU and
-MitsuGLU blocks, attention with rotary positions, a byte-pair tokenizer, disk-backed
-datasets, optimisers, a resumable training loop, cached text generation, a command-line
-tool, and a gradient checker that verifies every backward pass against finite differences.
-It trains residual MITSU networks hundreds of layers deep and sub-word language models, on
-a CPU.
+MitsuGLU blocks, convolutions, attention with rotary positions, automatic differentiation,
+a byte-pair tokenizer, disk-backed datasets, optimisers, a resumable training loop, cached
+text generation, a command-line tool, and a gradient checker that verifies every backward
+pass against finite differences. It trains residual MITSU networks hundreds of layers
+deep, convolutional networks and sub-word language models, on a CPU.
 
-The optional [PyTorch twin](#pytorch-twin) is the same language model written with PyTorch
+The optional [PyTorch twin](#gpu-the-pytorch-twin) builds the same networks from PyTorch
 modules, for GPUs and mixed precision. With identical weights the two agree to rounding
-error on the outputs, every gradient and the generated text, and they read and write the
-same files.
+error on the outputs and every gradient, they follow the same training run, and they read
+and write the same files. The twin has been verified on a CPU only; one command,
+`python -m mitsu_engine gpu-check`, verifies it on your GPU.
 
 ## Quick start
 
@@ -65,6 +66,8 @@ All numbers below were produced by the scripts in this repository on a 2-core CP
 | MNIST | `DeepMitsuNet`, 16 residual blocks | 4,418,826 | 98.20% test accuracy | 5 epochs, 3 min |
 | MNIST | `DeepMitsuNet`, 16 MitsuGLU blocks | 8,604,938 | 98.03% test accuracy | 5 epochs, 5.5 min |
 | Fashion-MNIST | `DeepMitsuNet`, 16 residual blocks | 4,418,826 | 89.89% test accuracy | 5 epochs, 3 min |
+| MNIST | `MitsuConvNet`, 3 stages, 16-32-64 channels | 121,386 | 99.35% test accuracy | 2 epochs, 9.5 min |
+| Fashion-MNIST | `MitsuConvNet`, 3 stages, 16-32-64 channels | 121,386 | 88.81% test accuracy | 2 epochs, 9.5 min |
 | Tiny Shakespeare, characters | `MitsuGPT`, 2 layers, width 64 | 111,488 | validation loss 1.76 nats per character | 2,000 steps, 2 min |
 | Tiny Shakespeare, 1,024 sub-word tokens | `MitsuLM`, 4 layers, width 128 | 918,144 | validation perplexity 28.6 (3.35 nats per token, 1.47 per byte) | 3,000 steps, 17 min |
 
@@ -95,8 +98,8 @@ fails at 16. That is why the deep models are built from normalised residual bloc
 | width 256, 6 layers, context 256 | 452 | 35 | 12.9× |
 
 The numpy engine is a CPU engine. It is the right size for research on networks up to tens
-of millions of parameters. Beyond that, the [PyTorch twin](#pytorch-twin) runs the same
-language model on a GPU.
+of millions of parameters. Beyond that, the [PyTorch twin](#gpu-the-pytorch-twin) runs the
+same networks on a GPU.
 
 ## Language models
 
@@ -172,11 +175,89 @@ A place of that,
 That is your corse of mine mind depart
 ```
 
-## PyTorch twin
+## Convolutions
 
-`mitsu_engine.twin` is `MitsuLM` written a second time, with PyTorch modules, so the model
-can run on a GPU and under mixed precision. The numpy engine stays the reference. The twin
-is trusted only because the tests load the same weights into both and require the same
+```python
+import mitsu_engine as me
+
+Xtr, ytr, Xte, yte = me.load_mnist(flatten=False)                  # images as (N, 1, 28, 28)
+model = me.MitsuConvNet(in_channels=1, n_classes=10, channels=(16, 32, 64), blocks=1)
+trainer = me.Trainer(model, me.AdamW(model.parameters(), lr=2e-3, weight_decay=0.01), clip_norm=1.0)
+trainer.fit(me.DataLoader(Xtr, ytr, 64), epochs=2)                 # 99.35% on the test set
+```
+
+| piece | what it does |
+|---|---|
+| `Conv2d` | 2-D convolution with any kernel size, stride and padding. Images are (batch, channels, height, width); the weight is (out, in, kernel, kernel), the layout PyTorch uses. |
+| `MaxPool2d`, `AvgPool2d`, `GlobalAvgPool2d` | Pooling, including overlapping windows. |
+| `GroupNorm` | Normalises groups of channels within each image. It keeps no batch statistics, so it behaves the same in training and evaluation and at any batch size. |
+| `MitsuConvNet` | Residual convolutional network: stages of `x + Conv(MITSU(Conv(GroupNorm(x))))` blocks, halving the image between stages, then global pooling and a linear layer. Its branches are initialised by the same rule as the deep feed-forward networks, so depth does not change the signal size. |
+
+A convolution gathers every input patch into one matrix once and is then a single matrix
+product; the backward pass reuses the same matrix. Each backward pass is checked three
+ways: against finite differences, against the engine's automatic differentiation, and
+against `torch.nn.functional` (outputs agree to 1e-12 across kernel sizes, strides and
+paddings).
+
+On a 2-core CPU a 28×28 batch of 64 takes about 0.3 seconds, so MNIST is five minutes an
+epoch. For larger images or networks, use the same model on a GPU through the twin.
+
+## Automatic differentiation
+
+`mitsu_engine.autograd` differentiates numpy code. The engine's own layers do not need it
+(their backward passes are written by hand), but it removes that step for anything new.
+
+```python
+import numpy as np
+import mitsu_engine as me
+from mitsu_engine import autograd as ag
+
+# 1. differentiate a formula: the mother function with all three seats live
+x, y, z = (ag.Tensor(v, requires_grad=True) for v in (1.2, 0.7, 1.9))
+f = (x ** (y + z) + y ** (x + z) + z ** (x + y)) / (x + y + z)
+f.backward()
+print(x.grad, y.grad, z.grad)
+
+# 2. write a layer without deriving its gradient
+class Affine(me.AutoModule):
+    def __init__(self, d_in, d_out):
+        self.weight = me.Parameter(me.init.linear_weight(d_in, d_out))
+        self.bias = me.Parameter(np.zeros(d_out), decay=False)
+
+    def compute(self, x):                       # Tensor in, Tensor out; Parameters used directly
+        return ag.mitsu(x @ self.weight + self.bias)
+
+net = me.Sequential(Affine(2, 32), Affine(32, 32), me.Linear(32, 3))     # mixes with hand-written layers
+```
+
+An `AutoModule` is an ordinary `Module`: it works in `Sequential` and `Residual`, with the
+optimisers, the `Trainer`, checkpoints and `gradcheck`. Hand-written layers can also be
+called inside `compute`.
+
+| | |
+|---|---|
+| arithmetic | `+ − × ÷`, `**` with a number or a tensor exponent, `@`, broadcasting |
+| functions | `exp`, `log`, `sqrt`, `tanh`, `sigmoid`, `softplus`, `mitsu`, `relu`, `silu`, `gelu`, `abs`, `maximum`, `minimum`, `where` |
+| reductions and shape | `sum`, `mean`, `max`, `reshape`, `transpose`, `swapaxes`, slicing, integer-array indexing, `concatenate`, `stack` |
+| networks | `softmax`, `log_softmax`, `cross_entropy`, `mse`, `dropout`, `conv2d`, `max_pool2d`, `avg_pool2d` |
+| helpers | `ag.grad(fn, *arrays)`, `ag.check(fn, *arrays)` (against finite differences) |
+
+How it is verified: every operation is checked against finite differences; MITSU written
+as the mother function `f(s, 1, 1) − 1` and differentiated automatically equals the
+hand-derived derivative to 1e-16; and the whole of `MitsuLM`, rewritten with tensor
+operations, gives the same gradient for every parameter as the hand-written backward pass,
+to 1e-11. With PyTorch's autograd on the twin, that makes three independent derivations of
+the same gradients.
+
+It costs a little speed: measured on a 2-core CPU, a training step of the 918k-parameter
+language model takes 26% longer with automatic differentiation than with the hand-written
+backward pass, and an 8-layer MLP 8% longer. It computes first derivatives only, on the CPU.
+
+## GPU: the PyTorch twin
+
+`mitsu_engine.twin` builds any engine model a second time from PyTorch modules, so it can
+run on a GPU and under mixed precision. The numpy engine stays the reference. The twin is
+trusted only because the tests load the same weights into both and require the same
 results. Nothing else in the package imports it: without PyTorch, everything above works
 as before.
 
@@ -184,6 +265,62 @@ as before.
 import mitsu_engine as me
 from mitsu_engine import twin
 
+model = me.MitsuConvNet(1, 10)                              # any engine model: MLP, DeepMitsuNet,
+net = twin.to_torch(model, device="cuda")                   # MitsuConvNet, MitsuGPT, MitsuLM, your own stack
+print(twin.compare_models(model, net, images))              # the largest differences
+
+trainer = twin.TorchTrainer(net, twin.EngineAdamW(net, lr=2e-3, weight_decay=0.01),
+                            loss="cross_entropy", metric="accuracy", clip_norm=1.0, amp="bf16")
+trainer.fit(me.DataLoader(Xtr, ytr, 64), epochs=2)          # the engine's loop, loaders, schedules and files
+twin.to_engine(net, model)                                  # the trained weights back in numpy
+```
+
+**Check your GPU first.** Nothing in this package has been run on a GPU: it was written and
+tested on a CPU, where every check below passes. This command runs the numpy engine on the
+CPU as the reference and the twin on your device, and prints `PASS` or `FAIL` for each of
+twelve checks (outputs and gradients of every kind of network, the same training run, each
+mixed-precision mode, moving a training state between engines, resuming, generated text,
+`torch.compile`, and speed):
+
+```bash
+pip install torch
+python -m mitsu_engine gpu-check --device cuda --compile --out gpu_report.json
+```
+
+A check that raises an error is reported as failed with the error, and the rest still run.
+`gpu_report.json` holds everything, including the device and library versions.
+
+**Every network has a twin.** Largest difference between the engine and its PyTorch copy,
+with the same weights, on a CPU (`twin.check_models`):
+
+| network | outputs, float64 | gradients, float64 | outputs, float32 | gradients, float32 |
+|---|---|---|---|---|
+| `MLP` | 3e-17 | 2e-15 | 6e-8 | 5e-7 |
+| `DeepMitsuNet`, both block types | 1e-15 | 2e-15 | 1e-6 | 1e-6 |
+| `MitsuConvNet` | 2e-16 | 1e-15 | 3e-7 | 1e-6 |
+| `MitsuGPT`, both feed-forward types | 5e-15 | 2e-15 | 3e-6 | 9e-7 |
+| a stack using every other layer | 2e-16 | 5e-15 | 1e-7 | 2e-6 |
+| attention without a mask, with bias | 2e-15 | 2e-15 | 1e-6 | 1e-6 |
+
+"Gradients" compares the engine's hand-written backward pass with PyTorch's autograd, for
+every parameter and for the input. A convolutional network and an MLP trained for two
+epochs with the same seed end with the same weights to 1e-10 and the same log, row for row.
+
+**Nothing left on the wrong device.** The usual way GPU code fails is a tensor (a mask, a
+position table) created on the CPU by mistake. PyTorch's `meta` device refuses to mix with
+CPU tensors, so the tests run every network's forward pass, backward pass, optimiser step
+and generation cache there. This is a GPU-style check that runs without a GPU. It found
+one weakness, since fixed: the tied output layer now reads its table from the embedding
+on every call, so no device move can untie it.
+
+**A layer of your own** (including an `AutoModule`) needs its PyTorch form named once:
+`twin.register(MyLayer, lambda layer, convert: MyTorchLayer(...))`.
+
+### The language model
+
+`MitsuLM` has a dedicated twin, `TorchMitsuLM`, with cached generation:
+
+```python
 reference = me.MitsuLM(me.LMConfig(vocab_size=1024))        # numpy
 net = twin.TorchMitsuLM.from_engine(reference)              # the same weights in PyTorch
 print(twin.compare(reference, net))                         # the largest differences
@@ -217,14 +354,14 @@ The tests also require:
 - **Mixed precision.** The twin trains under `bf16` and `fp16` autocast. MITSU divides
   before it multiplies and computes in float32 when given a half-precision input, so the
   activation is finite from −60,000 to 60,000 in both half types. This is the fix from MITSU
-  v1.0.1; it protects the activation, not the whole network (see `docs/TWIN.md`).
+  v1.0.1; it protects the activation, not the whole network (see `docs/GPU.md`).
 - **The main repository's module drops in.** `twin.TorchMitsuLM(config, glu=mitsu_torch.MitsuGLU)`
   uses the `MitsuGLU` from the main MITSU repository unchanged.
 
 **From the command line** the commands are the same, with a backend:
 
 ```bash
-python -m mitsu_engine parity   --device cuda --amp bf16 fp16          # run this first on a new machine
+python -m mitsu_engine gpu-check --device cuda                         # run this first on a new machine
 python -m mitsu_engine train    --data data/shake --out runs/gpu --backend torch --device cuda --amp bf16
 python -m mitsu_engine train    --data data/shake --out runs/gpu --backend torch --device cuda --amp bf16 --resume
 python -m mitsu_engine generate --run runs/gpu --backend torch --device cuda --prompt "ROMEO:"
@@ -232,9 +369,8 @@ python -m mitsu_engine generate --run runs/gpu --prompt "ROMEO:"       # the sam
 ```
 
 **What has and has not been run.** All of the above was run on a 2-core CPU. No GPU was
-available, so nothing here has executed on one. `parity --device cuda` compares the numpy
-engine on the CPU against the twin on your GPU and prints `PASS` or `FAIL`; it is the check
-this package could not make for itself. `docs/TWIN.md` lists what was run where.
+available, so nothing here has executed on one. `gpu-check --device cuda` is the check this
+package could not make for itself. `docs/GPU.md` lists what was run where.
 
 **Float32 runs drift apart, and that is expected.** With no dropout, the same seed gives
 both engines the same weights and the same batches, and in float64 they stay together (a
@@ -259,6 +395,9 @@ beside three PyTorch runs: consistent with seed-to-seed spread, and too few runs
 | width 512, 8 layers, context 256 | 27,267,584 | 2,057 ms | 974 ms | 2.1× | 146 tokens/s | 148 tokens/s |
 
 On a CPU the twin trains two to three times faster and generates at about the same speed.
+Convolutions gain more: the MNIST run above takes 40 seconds an epoch through the twin on the
+same CPU, against 260 in numpy, and reaches the same 99.35% (`examples/06_mnist_conv.py
+--backend torch --device cpu`).
 The reason to have it is the GPU.
 
 ## Design
@@ -270,10 +409,11 @@ y = layer.forward(x)          # also remembers what backward will need
 gx = layer.backward(gy)       # returns dL/dx and adds dL/dparameters into .grad
 ```
 
-There is no automatic differentiation. Each backward pass is derived by hand, and
-`gradcheck` compares it with finite differences. The tests run that check on every layer,
-block and model, including attention with rotary positions and the tied output layer, so a
-wrong derivative cannot slip in unnoticed.
+Each built-in backward pass is derived by hand, and `gradcheck` compares it with finite
+differences. The tests run that check on every layer, block and model, including
+convolutions, attention with rotary positions and the tied output layer, so a wrong
+derivative cannot slip in unnoticed. A layer of your own can skip the derivation: an
+`AutoModule` has its backward pass derived by `autograd`.
 
 | file | contents |
 |---|---|
@@ -282,7 +422,9 @@ wrong derivative cannot slip in unnoticed.
 | `layers.py` | `Linear`, `Embedding`, `TiedHead`, `LayerNorm`, `RMSNorm`, `Dropout`, `Flatten` |
 | `activations.py` | `MITSU` (with `c` and `gain`), `ReLU`, `GELU`, `SiLU`, `Tanh` |
 | `blocks.py` | `FeedForward`, `MitsuGLU`, `MultiHeadSelfAttention` (rotary, cached), `TransformerBlock`, `mitsu_block` |
-| `models.py` | `MLP`, `DeepMitsuNet`, `MitsuGPT`, `MitsuLM`, `LMConfig`, `sample_token` |
+| `conv.py` | `Conv2d`, `MaxPool2d`, `AvgPool2d`, `GlobalAvgPool2d`, `GroupNorm` |
+| `autograd.py` | `Tensor`, the differentiable operations, `AutoModule`, `grad`, `check` |
+| `models.py` | `MLP`, `DeepMitsuNet`, `MitsuConvNet`, `MitsuGPT`, `MitsuLM`, `LMConfig`, `sample_token` |
 | `tokenizer.py` | `BPETokenizer` |
 | `corpus.py` | `prepare_corpus`, `load_corpus`, token files, chunked reading |
 | `init.py` | weight initialisation and the measured MITSU constants it relies on |
@@ -291,8 +433,9 @@ wrong derivative cannot slip in unnoticed.
 | `data.py`, `datasets.py` | `DataLoader`, `Standardizer`, `CharTokenizer`, `TextBatcher`, MNIST and text loaders |
 | `trainer.py` | `Trainer`: epochs or steps, accumulation, evaluation, checkpoints, exact resume; `evaluate_lm` |
 | `io.py` | `save_checkpoint`, `load_checkpoint`, `read_meta` (model, optimiser state, metadata in one `.npz`) |
-| `cli.py` | the `prepare`, `train`, `generate` and `info` commands |
+| `cli.py` | the `prepare`, `train`, `generate`, `info`, `parity` and `gpu-check` commands |
 | `gradcheck.py` | the finite-difference checker |
+| `twin/` | the PyTorch copies (needs PyTorch): `to_torch`, `TorchMitsuLM`, `EngineAdamW`, `TorchTrainer`, parity checks, `gpucheck` |
 
 ### How it handles MITSU
 
@@ -329,8 +472,10 @@ print(net.summary())
 
 ### Writing a new layer
 
-Subclass `Module`, hold trainable arrays in `Parameter`s, and write `forward` and
-`backward`. Then let `gradcheck` tell you whether the derivative is right.
+The short way is an `AutoModule`: write `compute` and the gradient is derived for you (see
+[Automatic differentiation](#automatic-differentiation)). The fast way is to subclass
+`Module`, hold trainable arrays in `Parameter`s, and write `forward` and `backward`
+yourself. Then let `gradcheck` tell you whether the derivative is right.
 
 ```python
 import numpy as np
@@ -373,6 +518,9 @@ python3 examples/02_mnist.py --fashion                     # Fashion-MNIST
 python3 examples/03_char_gpt.py                            # character-level transformer
 python3 examples/04_language_model.py                      # tokenizer + MitsuLM, start to finish
 python3 examples/05_torch_twin.py                          # numpy and PyTorch side by side (needs PyTorch)
+python3 examples/06_mnist_conv.py                          # convolutional network on MNIST, 99.35%
+python3 examples/06_mnist_conv.py --backend torch --device cuda    # the same network on a GPU
+python3 examples/07_autodiff.py                            # differentiate the mother function; a three-seat layer
 python3 benchmarks/depth_sweep.py                          # 4 to 256 blocks
 python3 benchmarks/throughput.py                           # up to 67.7 million parameters
 python3 benchmarks/generation.py                           # cached against recomputed generation
@@ -384,22 +532,31 @@ python3 benchmarks/twin_trajectory.py                      # how long the two en
 
 ```bash
 pip install pytest
-pytest -q          # 140 tests in about 12 seconds; 190 in about 30 with PyTorch installed
+pytest -q          # 239 tests in about 12 seconds; 330 in about 40 with PyTorch installed
 ```
 
 They cover the MITSU formula against its definition; every backward pass against finite
 differences; rotary positions, tied embeddings and the generation cache; the tokenizer's
 lossless round trip; chunked encoding against whole-text encoding; the optimisers; exact
 resume; the command line end to end; and learning itself, including 48-layer networks and
-language models that memorise and regenerate a sequence. With PyTorch installed, 50 more
-tests check the twin against the engine; without it they are skipped. One of them uses the
-`mitsu_torch` package from the main MITSU repository and is skipped if that is not installed.
+language models that memorise and regenerate a sequence. They also cover every automatic
+differentiation operation, the convolution layers, and the whole language model
+differentiated two ways. With PyTorch installed, 92 more tests check the twin against the
+engine, including the device check itself and the device-discipline tests; without it they
+are skipped. One uses the `mitsu_torch` package from the main MITSU repository and is
+skipped if that is not installed.
 
 ## Limits
 
-- The engine itself is CPU and numpy only: no convolutions, no automatic differentiation.
-  The GPU path is the PyTorch twin, which covers `MitsuLM` only, runs on one device, and has
-  been tested on a CPU but not yet run on a GPU.
+- **The GPU path has not been run on a GPU.** It is the PyTorch twin, tested on a CPU, with
+  device-discipline tests that need no GPU. `python -m mitsu_engine gpu-check` is what
+  confirms it on real hardware. It runs on one device; there is no multi-GPU training.
+- The numpy engine is CPU only. Convolutions are practical at MNIST scale (five minutes an
+  epoch), not at ImageNet scale.
+- Automatic differentiation gives first derivatives only and runs on the CPU. An
+  `AutoModule` needs its PyTorch form registered before `twin.to_torch` can mirror it.
+- Convolutions are 2-D with square kernels; pooling has no padding; there is no batch
+  normalisation (group normalisation takes its place).
 - Very deep MitsuGLU stacks are sensitive to the learning rate: 128 blocks trained at
   1e-3 and failed at 2e-3. Keep it at or below 1e-3 with warm-up and gradient clipping.
 - The tokenizer is pure Python. Encoding runs at about 4 MB of text per second and training

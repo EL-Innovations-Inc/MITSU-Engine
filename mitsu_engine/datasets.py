@@ -29,8 +29,9 @@ def _find(folder, kind, name, download):
     return _fetch(_URLS[kind] + name, os.path.join(folder, f"{kind}-{name}"))
 
 
-def load_mnist(folder="data", kind="mnist", download=True):
-    """Return (X_train, y_train, X_test, y_test). Images are float32 in [0, 1], shape (N, 784).
+def load_mnist(folder="data", kind="mnist", download=True, flatten=True):
+    """Return (X_train, y_train, X_test, y_test). Images are float32 in [0, 1], shape (N, 784),
+    or (N, 1, 28, 28) with flatten=False (the layout the convolution layers take).
     kind is 'mnist' or 'fashion'."""
     if kind not in _URLS:
         raise ValueError("kind must be 'mnist' or 'fashion'")
@@ -38,7 +39,7 @@ def load_mnist(folder="data", kind="mnist", download=True):
 
     def images(p):
         with gzip.open(p) as f:
-            return (np.frombuffer(f.read(), np.uint8, offset=16).reshape(-1, 784) / 255.0).astype(np.float32)
+            return (np.frombuffer(f.read(), np.uint8, offset=16).reshape((-1, 784) if flatten else (-1, 1, 28, 28)) / 255.0).astype(np.float32)
 
     def labels(p):
         with gzip.open(p) as f:
