@@ -1,0 +1,68 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    env:
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip check
+
+      - name: Run test suite
+        run: python -m pytest -q
+
+      - name: Run spiral training example
+        run: python examples/01_spirals.py
+
+      # Run outside the checkout to exercise the installed package and CLI.
+      # A small local corpus keeps this independent of dataset downloads.
+      - name: Run language model end to end
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m mitsu_engine --help
+          mitsu-engine --help
+          python -c "from pathlib import Path; p = Path('mitsu-ci'); p.mkdir(exist_ok=True); (p / 'corpus.txt').write_text(('ROMEO: Hello, world!\nJULIET: Let us learn together.\n' * 200), encoding='utf-8')"
+          mitsu-engine prepare --text mitsu-ci/corpus.txt --out mitsu-ci/data --vocab-size 280
+          mitsu-engine train --data mitsu-ci/data --out mitsu-ci/run --steps 10 --stop-after 5 --d-model 16 --layers 2 --heads 2 --context 16 --batch 4 --warmup 2 --eval-every 5 --eval-windows 4 --log-every 5 --seed 0
+          mitsu-engine train --data mitsu-ci/data --out mitsu-ci/run --resume
+          mitsu-engine generate --run mitsu-ci/run --prompt "ROMEO:" --tokens 16 --seed 0
+          mitsu-engine info --run mitsu-ci/run
