@@ -69,29 +69,24 @@ class CharTokenizer:
 
 
 class TextBatcher:
-    """Random (input, next-token target) windows from a token array, for language modelling.
-    `tokens` may be an in-memory array or a memory-mapped token file (corpus.open_tokens);
-    only the windows that are drawn are read from disk."""
+    """Random (input, next-token target) windows from a token array, for language modelling."""
 
     def __init__(self, tokens, context, batch_size, rng=None):
-        if len(tokens) < context + 2:
-            raise ValueError(f"need at least context + 2 = {context + 2} tokens, got {len(tokens)}")
-        self.tokens, self.context, self.batch_size = tokens, context, batch_size
+        self.tokens, self.context, self.batch_size = np.asarray(tokens), context, batch_size
         self.rng = config.get_rng(rng)
 
     def __call__(self):
         start = self.rng.integers(0, len(self.tokens) - self.context - 1, self.batch_size)
         idx = start[:, None] + np.arange(self.context)[None, :]
-        return np.asarray(self.tokens[idx], dtype=np.int64), np.asarray(self.tokens[idx + 1], dtype=np.int64)
+        return self.tokens[idx], self.tokens[idx + 1]
 
-    def windows(self, batch_size=64, max_windows=None):
-        """Non-overlapping windows in order, for evaluation: all of them, or `max_windows`
-        spread evenly across the data."""
+    def windows(self, batch_size=256):
+        """Every non-overlapping window once, in order: for evaluation."""
         n = (len(self.tokens) - 1) // self.context
-        which = np.arange(n) if not max_windows or max_windows >= n else np.linspace(0, n - 1, max_windows).astype(np.int64)
-        for i in range(0, len(which), batch_size):
-            idx = (which[i:i + batch_size] * self.context)[:, None] + np.arange(self.context)[None, :]
-            yield np.asarray(self.tokens[idx], dtype=np.int64), np.asarray(self.tokens[idx + 1], dtype=np.int64)
+        X = self.tokens[: n * self.context].reshape(n, self.context)
+        Y = self.tokens[1: n * self.context + 1].reshape(n, self.context)
+        for i in range(0, n, batch_size):
+            yield X[i:i + batch_size], Y[i:i + batch_size]
 
 
 def make_spirals(n_per_class=500, classes=3, turns=1.75, noise=0.12, rng=None):

@@ -1,4 +1,4 @@
-"""Basic layers: Linear, Embedding, TiedHead, LayerNorm, RMSNorm, Dropout, Flatten."""
+"""Basic layers: Linear, Embedding, LayerNorm, Dropout, Flatten."""
 import numpy as np
 from . import config, init as initlib
 from .module import Module, Parameter
@@ -122,63 +122,3 @@ class Flatten(Module):
 
     def backward(self, grad):
         return grad.reshape(self._c_shape)
-
-
-class RMSNorm(Module):
-    """y = gain * x / sqrt(mean(x^2) + eps) on the last axis. LayerNorm without the
-    centring and the bias: the normalisation used by Llama-style language models."""
-
-    def __init__(self, dim, eps=1e-6):
-        self.dim, self.eps = dim, eps
-        self.gain = Parameter(np.ones(dim), decay=False)
-        self._c = None
-
-    def forward(self, x):
-        inv = 1.0 / np.sqrt((x * x).mean(-1, keepdims=True) + self.eps)
-        xhat = x * inv
-        if config.grad_enabled():
-            self._c = (xhat, inv)
-        return xhat * self.gain.data
-
-    def backward(self, grad):
-        xhat, inv = self._c
-        self.gain.grad += (grad * xhat).reshape(-1, self.dim).sum(0)
-        gh = grad * self.gain.data
-        return (gh - xhat * (gh * xhat).mean(-1, keepdims=True)) * inv
-
-    def extra_repr(self):
-        return f"{self.dim}"
-
-
-class TiedHead(Module):
-    """Output layer that reuses an Embedding's table: logits = x E^T.
-
-    The table is one Parameter shared with the Embedding, so it is stored, counted and
-    updated once, and receives gradient from both uses."""
-
-    def __init__(self, embedding):
-        self.weight = embedding.weight
-        self.dim = embedding.dim
-        self._c_x = None
-
-    def forward(self, x):
-        if config.grad_enabled():
-            self._c_x = x
-        return x @ self.weight.data.T
-
-    def backward(self, grad):
-        g2 = grad.reshape(-1, self.weight.data.shape[0])
-        self.weight.grad += g2.T @ self._c_x.reshape(-1, self.dim)
-        return grad @ self.weight.data
-
-    def extra_repr(self):
-        return f"tied, {self.dim} -> {self.weight.data.shape[0]}"
-
-
-def get_norm(kind, dim):
-    """'layer' -> LayerNorm(dim), 'rms' -> RMSNorm(dim)."""
-    if kind == "layer":
-        return LayerNorm(dim)
-    if kind == "rms":
-        return RMSNorm(dim)
-    raise ValueError("norm must be 'layer' or 'rms'")

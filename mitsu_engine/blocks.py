@@ -1,16 +1,16 @@
 """Building blocks: feed-forward branches, MitsuGLU, self-attention, residual blocks.
 
-Initialisation convention for every branch that sits inside a residual connection:
-the input is normalised (unit variance), the first layer keeps it unit-variance, and the
-LAST layer of the branch is scaled so the branch's output has variance `out_scale`^2.
-Models pass out_scale = branch_scale / sqrt(number of branches), so the residual stream's
-variance stays bounded however deep the network is.
+Initialisation convention for every branch that sits inside a Residual:
+the input is LayerNorm-ed (unit variance), the first layer keeps it unit-variance,
+and the LAST layer of the branch is scaled so the branch's output has variance
+`out_scale`^2. Models pass out_scale = branch_scale / sqrt(number of branches), so
+the residual stream's variance stays bounded however deep the network is.
 """
 import math
 import numpy as np
 from . import config, functional as F, init as initlib
 from .module import Module, Sequential, Residual, Parameter
-from .layers import Linear, LayerNorm, Dropout, get_norm
+from .layers import Linear, LayerNorm, Dropout
 from .activations import MITSU, get_activation
 
 
@@ -66,52 +66,15 @@ class MitsuGLU(Module):
         return f"{self.dim} -> {self.hidden} -> {self.dim}"
 
 
-# ---- rotary position encoding ------------------------------------------------
-
-def rope_tables(length, head_dim, base=10000.0, offset=0, dtype=np.float32):
-    """cos and sin tables of shape (length, head_dim / 2) for positions offset .. offset + length - 1."""
-    freq = base ** (-np.arange(0, head_dim, 2, dtype=np.float64) / head_dim)
-    angle = (offset + np.arange(length, dtype=np.float64))[:, None] * freq[None, :]
-    return np.cos(angle).astype(dtype), np.sin(angle).astype(dtype)
-
-
-def rope_rotate(x, cos, sin):
-    """Rotate each consecutive pair of features of x (..., time, head_dim) by its position's angle."""
-    out = np.empty_like(x)
-    x1, x2 = x[..., 0::2], x[..., 1::2]
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
-    return out
-
-
-def rope_unrotate(g, cos, sin):
-    """The transpose of rope_rotate (a rotation by the opposite angle): its backward pass."""
-    out = np.empty_like(g)
-    g1, g2 = g[..., 0::2], g[..., 1::2]
-    out[..., 0::2] = g1 * cos + g2 * sin
-    out[..., 1::2] = g2 * cos - g1 * sin
-    return out
-
-
 class MultiHeadSelfAttention(Module):
-    """Scaled dot-product self-attention over (batch, time, dim).
+    """Scaled dot-product self-attention over (batch, time, dim). `causal=True` stops
+    each position from seeing later ones (language modelling)."""
 
-    causal=True  each position sees only itself and earlier positions (language modelling)
-    rope=True    rotary position encoding: queries and keys are rotated by an angle that
-                 grows with position, so attention depends on relative distance and the
-                 model needs no separate position embedding
-
-    `step` is the incremental form used for generation: it processes only the new tokens
-    and reuses the keys and values of everything before them.
-    """
-
-    def __init__(self, dim, n_heads, causal=True, bias=False, out_scale=1.0, rope=False, rope_base=10000.0, rng=None):
+    def __init__(self, dim, n_heads, causal=True, bias=False, out_scale=1.0, rng=None):
         if dim % n_heads:
             raise ValueError("dim must be divisible by n_heads")
-        if rope and (dim // n_heads) % 2:
-            raise ValueError("rotary encoding needs an even head size (dim / n_heads)")
         rng = config.get_rng(rng)
-        self.dim, self.n_heads, self.causal, self.rope, self.rope_base = dim, n_heads, causal, rope, rope_base
+        self.dim, self.n_heads, self.causal = dim, n_heads, causal
         self.qkv = Linear(dim, 3 * dim, bias=bias, init="lecun", rng=rng)
         self.proj = Linear(dim, dim, bias=bias, init="lecun", scale=out_scale, rng=rng)
         self._c = None
@@ -122,74 +85,46 @@ class MultiHeadSelfAttention(Module):
     def _merge(self, x, B, T):      # (B, H, T, D/H) -> (B, T, D)
         return x.transpose(0, 2, 1, 3).reshape(B, T, self.dim)
 
-    def _qkv(self, x, offset):
-        B, T, D = x.shape
-        q, k, v = (self._split(part, B, T) for part in np.split(self.qkv(x), 3, axis=-1))
-        tables = None
-        if self.rope:
-            tables = rope_tables(T, D // self.n_heads, self.rope_base, offset, x.dtype)
-            q, k = rope_rotate(q, *tables), rope_rotate(k, *tables)
-        return q, k, v, tables
-
     def forward(self, x):
         B, T, D = x.shape
-        q, k, v, tables = self._qkv(x, 0)
+        q, k, v = (self._split(part, B, T) for part in np.split(self.qkv(x), 3, axis=-1))
         scale = 1.0 / math.sqrt(D // self.n_heads)
         att = (q @ k.transpose(0, 1, 3, 2)) * scale
         if self.causal:
             att = att + np.triu(np.full((T, T), -np.inf, dtype=att.dtype), 1)
         p = F.softmax(att, -1)
         if config.grad_enabled():
-            self._c = (q, k, v, p, scale, B, T, tables)
+            self._c = (q, k, v, p, scale, B, T)
         return self.proj(self._merge(p @ v, B, T))
 
     def backward(self, grad):
-        q, k, v, p, scale, B, T, tables = self._c
+        q, k, v, p, scale, B, T = self._c
         go = self._split(self.proj.backward(grad), B, T)
         gp = go @ v.transpose(0, 1, 3, 2)
         gv = p.transpose(0, 1, 3, 2) @ go
         gatt = p * (gp - (gp * p).sum(-1, keepdims=True)) * scale
         gq = gatt @ k
         gk = gatt.transpose(0, 1, 3, 2) @ q
-        if tables is not None:
-            gq, gk = rope_unrotate(gq, *tables), rope_unrotate(gk, *tables)
         gqkv = np.concatenate([self._merge(g, B, T) for g in (gq, gk, gv)], axis=-1)
         return self.qkv.backward(gqkv)
 
-    def step(self, x, cache=None):
-        """Attend from the new tokens x (batch, new, dim) to everything seen so far.
-        `cache` holds the keys and values of earlier tokens; returns (output, new cache).
-        Inference only: nothing is stored for backward."""
-        B, T, D = x.shape
-        past = 0 if cache is None else cache["k"].shape[2]
-        with config.no_grad():
-            q, k, v, _ = self._qkv(x, past)
-            if past:
-                k = np.concatenate([cache["k"], k], axis=2)
-                v = np.concatenate([cache["v"], v], axis=2)
-            att = (q @ k.transpose(0, 1, 3, 2)) * (1.0 / math.sqrt(D // self.n_heads))
-            if self.causal and T > 1:
-                att[..., past:] += np.triu(np.full((T, T), -np.inf, dtype=att.dtype), 1)
-            out = self.proj(self._merge(F.softmax(att, -1) @ v, B, T))
-        return out, {"k": k, "v": v}
-
     def extra_repr(self):
-        return f"dim={self.dim}, heads={self.n_heads}, causal={self.causal}, rope={self.rope}"
+        return f"dim={self.dim}, heads={self.n_heads}, causal={self.causal}"
 
 
-def residual_branch(dim, inner, dropout=0.0, norm="layer", rng=None):
-    """Residual( norm -> inner [-> Dropout] ): the pre-norm residual unit."""
-    layers = [get_norm(norm, dim), inner]
+def residual_branch(dim, inner, dropout=0.0, rng=None):
+    """Residual( LayerNorm -> inner [-> Dropout] ): the pre-norm residual unit."""
+    layers = [LayerNorm(dim), inner]
     if dropout > 0:
         layers.append(Dropout(dropout, rng=rng))
     return Residual(Sequential(*layers))
 
 
-def mitsu_block(dim, hidden=None, kind="mlp", activation="mitsu", dropout=0.0, out_scale=1.0, norm="layer", rng=None):
+def mitsu_block(dim, hidden=None, kind="mlp", activation="mitsu", dropout=0.0, out_scale=1.0, rng=None):
     """One pre-norm residual block for deep feed-forward networks.
 
-    kind='mlp':  x + W2 act(W1 norm(x))        hidden defaults to 2 * dim
-    kind='glu':  x + MitsuGLU(norm(x))         hidden defaults to 8/3 * dim
+    kind='mlp':  x + W2 act(W1 LN(x))          hidden defaults to 2 * dim
+    kind='glu':  x + MitsuGLU(LN(x))           hidden defaults to 8/3 * dim
     """
     rng = config.get_rng(rng)
     if kind == "mlp":
@@ -198,44 +133,29 @@ def mitsu_block(dim, hidden=None, kind="mlp", activation="mitsu", dropout=0.0, o
         inner = MitsuGLU(dim, hidden, out_scale=out_scale, rng=rng)
     else:
         raise ValueError("kind must be 'mlp' or 'glu'")
-    return residual_branch(dim, inner, dropout, norm, rng)
+    return residual_branch(dim, inner, dropout, rng)
 
 
 class TransformerBlock(Module):
-    """Pre-norm transformer block:
+    """Pre-norm transformer block: x + Attention(LN(x)), then x + FeedForward(LN(x)).
 
-        x = x + Dropout(Attention(norm1(x)))
-        x = x + Dropout(FeedForward(norm2(x)))
-
-    ffn='glu'  MitsuGLU, hidden 8/3 * dim           ffn='mlp'  Linear-activation-Linear, hidden 4 * dim
-    norm='layer' or 'rms'                           rope=True  rotary position encoding in the attention
+    ffn='glu' uses MitsuGLU (hidden 8/3 * dim); ffn='mlp' uses Linear-activation-Linear
+    (hidden 4 * dim) with `activation`.
     """
 
-    def __init__(self, dim, n_heads, ffn="glu", activation="mitsu", hidden=None, causal=True, dropout=0.0, out_scale=1.0,
-                 norm="layer", rope=False, rope_base=10000.0, gate_mult=initlib.GATE_MULT, rng=None):
+    def __init__(self, dim, n_heads, ffn="glu", activation="mitsu", hidden=None, causal=True, dropout=0.0, out_scale=1.0, rng=None):
         rng = config.get_rng(rng)
-        self.norm1 = get_norm(norm, dim)
-        self.attn = MultiHeadSelfAttention(dim, n_heads, causal, out_scale=out_scale, rope=rope, rope_base=rope_base, rng=rng)
-        self.drop1 = Dropout(dropout, rng=rng)
-        self.norm2 = get_norm(norm, dim)
+        self.attn = residual_branch(dim, MultiHeadSelfAttention(dim, n_heads, causal, out_scale=out_scale, rng=rng), dropout, rng)
         if ffn == "glu":
-            self.ffn = MitsuGLU(dim, hidden, gate_mult=gate_mult, out_scale=out_scale, rng=rng)
+            inner = MitsuGLU(dim, hidden, out_scale=out_scale, rng=rng)
         elif ffn == "mlp":
-            self.ffn = FeedForward(dim, hidden or 4 * dim, activation, bias=False, out_scale=out_scale, rng=rng)
+            inner = FeedForward(dim, hidden or 4 * dim, activation, bias=False, out_scale=out_scale, rng=rng)
         else:
             raise ValueError("ffn must be 'glu' or 'mlp'")
-        self.drop2 = Dropout(dropout, rng=rng)
+        self.ff = residual_branch(dim, inner, dropout, rng)
 
     def forward(self, x):
-        x = x + self.drop1(self.attn(self.norm1(x)))
-        return x + self.drop2(self.ffn(self.norm2(x)))
+        return self.ff(self.attn(x))
 
     def backward(self, grad):
-        grad = grad + self.norm2.backward(self.ffn.backward(self.drop2.backward(grad)))
-        return grad + self.norm1.backward(self.attn.backward(self.drop1.backward(grad)))
-
-    def step(self, x, cache=None):
-        """Incremental forward for generation (evaluation mode, no dropout). Returns (x, cache)."""
-        a, cache = self.attn.step(self.norm1(x), cache)
-        x = x + a
-        return x + self.ffn(self.norm2(x)), cache
+        return self.attn.backward(self.ff.backward(grad))

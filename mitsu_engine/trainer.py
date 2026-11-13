@@ -1,10 +1,9 @@
-"""Training loop: evaluation, schedules, clipping, gradient accumulation, checkpoints,
-early stopping, a JSON-lines log, and exact resume."""
-import json, math, os, time
+"""Training loop with evaluation, schedules, clipping, checkpoints and early stopping."""
+import math, time
 import numpy as np
 from . import config
 from .losses import CrossEntropy, accuracy
-from .optim import clip_grad_norm, grad_norm
+from .optim import clip_grad_norm
 from .io import save_checkpoint, load_checkpoint
 
 
@@ -24,33 +23,21 @@ class Trainer:
         self.history = []
         self.step = 0
 
-    # ---- one optimisation step ---------------------------------------------
-    def train_step(self, x=None, y=None, next_batch=None, accumulate=1):
-        """One optimisation step. Returns (loss, metric, gradient norm before clipping).
-
-        Either pass one batch (x, y), or pass `next_batch` (a callable returning (x, y))
-        with accumulate=k: the gradients of k batches are averaged before the update,
-        which is equivalent to one batch k times as large but uses a k-th of the memory."""
+    def train_step(self, x, y):
+        """One optimisation step. Returns (loss, metric, gradient norm before clipping)."""
         self.model.train()
         if self.scheduler is not None:
             self.optimizer.lr = self.scheduler(self.step)
         self.optimizer.zero_grad()
-        tot_loss = tot_metric = 0.0
-        for _ in range(accumulate):
-            if next_batch is not None:
-                x, y = next_batch()
-            out = self.model(x)
-            loss, grad = self.loss_fn(out, y)
-            if not math.isfinite(loss):
-                raise FloatingPointError(f"loss became {loss} at step {self.step}")
-            self.model.backward(grad if accumulate == 1 else grad / accumulate)
-            tot_loss += loss / accumulate
-            tot_metric += (self.metric(out, y) if self.metric else float("nan")) / accumulate
-        params = self.optimizer.params
-        gnorm = clip_grad_norm(params, self.clip_norm) if self.clip_norm else grad_norm(params)
+        out = self.model(x)
+        loss, grad = self.loss_fn(out, y)
+        if not math.isfinite(loss):
+            raise FloatingPointError(f"loss became {loss} at step {self.step}")
+        self.model.backward(grad)
+        gnorm = clip_grad_norm(self.optimizer.params, self.clip_norm) if self.clip_norm else float("nan")
         self.optimizer.step()
         self.step += 1
-        return tot_loss, tot_metric, gnorm
+        return loss, (self.metric(out, y) if self.metric else float("nan")), gnorm
 
     def evaluate(self, batches):
         """Average loss and metric over an iterable of (x, y) batches, without gradients."""
@@ -67,7 +54,6 @@ class Trainer:
         self.model.train()
         return {"loss": tot_loss / max(n, 1), "metric": tot_metric / max(n, 1)}
 
-    # ---- epoch-based training ---------------------------------------------
     def fit(self, train_loader, val_loader=None, epochs=1, checkpoint=None, patience=None):
         """Train for `epochs` passes. With `checkpoint`, the best model by validation loss is
         saved there and restored at the end. With `patience`, stop after that many epochs
@@ -101,74 +87,23 @@ class Trainer:
             load_checkpoint(checkpoint, self.model)
         return self.history
 
-    # ---- step-based training ----------------------------------------------
-    def fit_steps(self, next_batch, steps, eval_fn=None, eval_every=None, log_every=None, accumulate=1,
-                  state_path=None, state_every=None, log_file=None, rngs=None):
-        """Train until the step counter reaches `steps`, drawing batches from `next_batch()`.
-
-        eval_fn       callable returning a dict; called every `eval_every` steps and at the end
-        accumulate    average the gradients of this many batches per step
-        state_path    write the full training state there every `state_every` steps and at the
-                      end, so an interrupted run continues exactly with load_state()
-        log_file      append one JSON line per logged row
-        rngs          extra named random generators to save with the state (see save_state)
-
-        `steps` is the total: a trainer resumed at step 600 with steps=1000 runs 400 more."""
-        t0, run_loss, run_n, gmax = time.time(), 0.0, 0, 0.0
-        while self.step < steps:
-            loss, _, gnorm = self.train_step(next_batch=next_batch, accumulate=accumulate)
-            run_loss += loss; run_n += 1; gmax = max(gmax, gnorm)
-            i = self.step
+    def fit_steps(self, next_batch, steps, eval_fn=None, eval_every=None, log_every=None):
+        """Train for a fixed number of steps, drawing batches from the callable `next_batch`.
+        `eval_fn()` (returning a dict) is called every `eval_every` steps and at the end."""
+        t0, run_loss, run_n = time.time(), 0.0, 0
+        for i in range(1, steps + 1):
+            x, y = next_batch()
+            loss, metric, gnorm = self.train_step(x, y)
+            run_loss += loss; run_n += 1
             at_eval = eval_fn is not None and ((eval_every and i % eval_every == 0) or i == steps)
             if at_eval or (log_every and i % log_every == 0):
-                row = {"step": i, "train_loss": run_loss / run_n, "grad_norm_max": gmax, "lr": self.optimizer.lr, "seconds": time.time() - t0}
-                msg = f"step {i:6d}  train loss {row['train_loss']:.4f}  grad norm max {gmax:.2f}"
+                row = {"step": self.step, "train_loss": run_loss / run_n, "lr": self.optimizer.lr, "seconds": time.time() - t0}
+                msg = f"step {self.step:6d}  train loss {row['train_loss']:.4f}"
                 if at_eval:
                     val = eval_fn()
                     row.update({"val_" + k: v for k, v in val.items()})
                     msg += "  |  " + "  ".join(f"val {k} {v:.4f}" for k, v in val.items())
                 self.history.append(row)
                 self.log(msg + f"  |  {row['seconds']:.0f}s")
-                if log_file:
-                    with open(log_file, "a") as f:
-                        f.write(json.dumps(row) + "\n")
-                run_loss, run_n, gmax = 0.0, 0, 0.0
-            if state_path and ((state_every and i % state_every == 0) or i == steps):
-                self.save_state(state_path, rngs)
+                run_loss, run_n = 0.0, 0
         return self.history
-
-    # ---- exact resume ------------------------------------------------------
-    def save_state(self, path, rngs=None, meta=None):
-        """Save everything needed to continue this run exactly: model, optimiser, step
-        counter, history, and the state of the random generators (the global one, plus
-        any passed in `rngs` as {name: Generator})."""
-        state = {"step": self.step, "history": self.history, "global_rng": config.get_rng_state(),
-                 "rngs": {name: config.get_rng_state(g) for name, g in (rngs or {}).items()}}
-        save_checkpoint(path, self.model, self.optimizer, meta={**(meta or {}), "trainer": state})
-
-    def load_state(self, path, rngs=None):
-        """Restore a state written by save_state into this trainer's model and optimiser.
-        Components must have been built the same way; random generators continue from
-        where they were. Returns the checkpoint's metadata."""
-        meta = load_checkpoint(path, self.model, self.optimizer)
-        state = meta["trainer"]
-        self.step, self.history = state["step"], state["history"]
-        config.set_rng_state(state["global_rng"])
-        for name, g in (rngs or {}).items():
-            config.set_rng_state(state["rngs"][name], g)
-        return meta
-
-
-def evaluate_lm(model, batches):
-    """Loss (nats per token) and perplexity of a language model over (x, y) batches."""
-    loss_fn, tot, n = CrossEntropy(), 0.0, 0
-    was_training = model.training
-    model.eval()
-    with config.no_grad():
-        for x, y in batches:
-            loss, _ = loss_fn(model(x), y)
-            tot += loss * y.size
-            n += y.size
-    model.train(was_training)
-    loss = tot / max(n, 1)
-    return {"loss": loss, "perplexity": math.exp(min(loss, 50.0))}

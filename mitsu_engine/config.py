@@ -32,16 +32,6 @@ def get_rng(rng=None):
     return rng
 
 
-def get_rng_state(rng=None):
-    """The state of a generator (the global one by default) as a JSON-serialisable dict."""
-    return get_rng(rng).bit_generator.state
-
-
-def set_rng_state(state, rng=None):
-    """Restore a state captured by get_rng_state, so random draws continue exactly."""
-    get_rng(rng).bit_generator.state = state
-
-
 def grad_enabled():
     return _state["grad"]
 
