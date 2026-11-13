@@ -1,4 +1,4 @@
-# MITSU-Engine
+# MITSU-Engine-v0.1.0
 
 A neural-network engine built around the MITSU activation, written from scratch in Python
 with numpy as its only dependency.
