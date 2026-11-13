@@ -1,7 +1,8 @@
-# MITSU Engine v0.2.0
+# mitsu-engine
 
 A neural-network and language-model engine built around the MITSU activation, written from
-scratch in Python with numpy as its only dependency.
+scratch in Python with numpy as its only dependency, and a PyTorch twin of its language
+model that is tested to reproduce it.
 
 ```
 MITSU(u) = s (s − 1) / (s + 2),   s = softplus(u)
@@ -13,6 +14,11 @@ datasets, optimisers, a resumable training loop, cached text generation, a comma
 tool, and a gradient checker that verifies every backward pass against finite differences.
 It trains residual MITSU networks hundreds of layers deep and sub-word language models, on
 a CPU.
+
+The optional [PyTorch twin](#pytorch-twin) is the same language model written with PyTorch
+modules, for GPUs and mixed precision. With identical weights the two agree to rounding
+error on the outputs, every gradient and the generated text, and they read and write the
+same files.
 
 ## Quick start
 
@@ -47,6 +53,7 @@ me.save_checkpoint("spirals.npz", model)
 ```
 
 To install it as a package (this also adds a `mitsu-engine` command): `pip install .`
+The PyTorch twin needs PyTorch as well: `pip install ".[torch]"`.
 
 ## What it does, measured
 
@@ -87,8 +94,9 @@ fails at 16. That is why the deep models are built from normalised residual bloc
 | width 128, 4 layers, context 128 | 1,551 | 256 | 6.1× |
 | width 256, 6 layers, context 256 | 452 | 35 | 12.9× |
 
-This is a CPU engine. It is the right size for research on networks up to tens of millions
-of parameters; it is not a substitute for a GPU framework at large-language-model scale.
+The numpy engine is a CPU engine. It is the right size for research on networks up to tens
+of millions of parameters. Beyond that, the [PyTorch twin](#pytorch-twin) runs the same
+language model on a GPU.
 
 ## Language models
 
@@ -163,6 +171,95 @@ MERCUTIO:
 A place of that,
 That is your corse of mine mind depart
 ```
+
+## PyTorch twin
+
+`mitsu_engine.twin` is `MitsuLM` written a second time, with PyTorch modules, so the model
+can run on a GPU and under mixed precision. The numpy engine stays the reference. The twin
+is trusted only because the tests load the same weights into both and require the same
+results. Nothing else in the package imports it: without PyTorch, everything above works
+as before.
+
+```python
+import mitsu_engine as me
+from mitsu_engine import twin
+
+reference = me.MitsuLM(me.LMConfig(vocab_size=1024))        # numpy
+net = twin.TorchMitsuLM.from_engine(reference)              # the same weights in PyTorch
+print(twin.compare(reference, net))                         # the largest differences
+```
+
+**Same weights in, same results out.** Measured on a CPU by `python -m mitsu_engine parity`,
+on a small random model and on the trained 918,144-parameter model from the table above
+(each cell: small model · trained model):
+
+| largest difference between the engines | float64 | float32 |
+|---|---|---|
+| logits | 3e-15 · 1e-14 | 1e-6 · 1e-5 |
+| loss | 0 · 0 | 5e-7 · 2e-6 |
+| any gradient (numpy's hand-written backward against PyTorch autograd) | 4e-15 · 2e-15 | 3e-6 · 1e-6 |
+| logits along the cached generation path | 2e-15 · 1e-14 | 1e-6 · 7e-6 |
+| generated tokens | identical | identical |
+
+The tests also require:
+
+- **The same text.** Greedy, temperature, top-k and top-p sampling return the same tokens
+  from both engines, with and without the cache, including past the context window.
+- **The same start.** `TorchMitsuLM(config, rng=5)` and `MitsuLM(config, rng=5)` hold the
+  same initial weights, bit for bit: the numpy engine draws them for both.
+- **The same training run.** `twin.EngineAdamW` and `twin.clip_grad_norm` follow the
+  engine's rules, and the schedule and the batcher are the engine's own objects. After 30
+  steps with warm-up, cosine decay, clipping, weight decay and gradient accumulation in
+  float64, the two hold the same weights to 7e-15.
+- **One file format.** A model or a training state written by either engine loads in the
+  other. A run can start in numpy and finish in PyTorch, or the reverse, and ends with the
+  weights an uninterrupted run would have (tested in float64, both directions).
+- **Mixed precision.** The twin trains under `bf16` and `fp16` autocast. MITSU divides
+  before it multiplies and computes in float32 when given a half-precision input, so the
+  activation is finite from −60,000 to 60,000 in both half types. This is the fix from MITSU
+  v1.0.1; it protects the activation, not the whole network (see `docs/TWIN.md`).
+- **The main repository's module drops in.** `twin.TorchMitsuLM(config, glu=mitsu_torch.MitsuGLU)`
+  uses the `MitsuGLU` from the main MITSU repository unchanged.
+
+**From the command line** the commands are the same, with a backend:
+
+```bash
+python -m mitsu_engine parity   --device cuda --amp bf16 fp16          # run this first on a new machine
+python -m mitsu_engine train    --data data/shake --out runs/gpu --backend torch --device cuda --amp bf16
+python -m mitsu_engine train    --data data/shake --out runs/gpu --backend torch --device cuda --amp bf16 --resume
+python -m mitsu_engine generate --run runs/gpu --backend torch --device cuda --prompt "ROMEO:"
+python -m mitsu_engine generate --run runs/gpu --prompt "ROMEO:"       # the same model on numpy, no GPU
+```
+
+**What has and has not been run.** All of the above was run on a 2-core CPU. No GPU was
+available, so nothing here has executed on one. `parity --device cuda` compares the numpy
+engine on the CPU against the twin on your GPU and prints `PASS` or `FAIL`; it is the check
+this package could not make for itself. `docs/TWIN.md` lists what was run where.
+
+**Float32 runs drift apart, and that is expected.** With no dropout, the same seed gives
+both engines the same weights and the same batches, and in float64 they stay together (a
+918k-parameter model: weights within 7e-10 after 300 steps). In float32 the two round
+differently and training amplifies the difference: on that model the training losses agree
+to 6e-8 at step 100 and to 3e-3 at step 600, where validation loss is 3.77203 on numpy and
+3.77196 on PyTorch. They are two valid runs of one experiment, not the same digits.
+
+With dropout the engines also draw different masks, so runs differ the way runs with
+different seeds do (a test checks that the two dropouts give the same loss distribution).
+The stage-1 run above (918,144 parameters, dropout 0.1, 3,000 steps) ended at validation
+loss 3.351 on numpy. The same command on the PyTorch backend ended at 3.381, 3.353 and
+3.393 for seeds 0, 1 and 2 (perplexity 28.6 to 29.8, against 28.5). That is one numpy run
+beside three PyTorch runs: consistent with seed-to-seed spread, and too few runs to say more.
+
+**Speed on a CPU** (`benchmarks/twin_speed.py`, 2 threads, same weights and batch):
+
+| model | parameters | numpy step | PyTorch step | | numpy generation | PyTorch generation |
+|---|---|---|---|---|---|---|
+| width 128, 4 layers, context 128 | 1,311,360 | 370 ms | 165 ms | 2.2× | 911 tokens/s | 844 tokens/s |
+| width 256, 6 layers, context 256 | 5,772,032 | 1,344 ms | 467 ms | 2.9× | 459 tokens/s | 397 tokens/s |
+| width 512, 8 layers, context 256 | 27,267,584 | 2,057 ms | 974 ms | 2.1× | 146 tokens/s | 148 tokens/s |
+
+On a CPU the twin trains two to three times faster and generates at about the same speed.
+The reason to have it is the GPU.
 
 ## Design
 
@@ -275,29 +372,34 @@ python3 examples/02_mnist.py --model deep --block glu      # MitsuGLU blocks
 python3 examples/02_mnist.py --fashion                     # Fashion-MNIST
 python3 examples/03_char_gpt.py                            # character-level transformer
 python3 examples/04_language_model.py                      # tokenizer + MitsuLM, start to finish
+python3 examples/05_torch_twin.py                          # numpy and PyTorch side by side (needs PyTorch)
 python3 benchmarks/depth_sweep.py                          # 4 to 256 blocks
 python3 benchmarks/throughput.py                           # up to 67.7 million parameters
 python3 benchmarks/generation.py                           # cached against recomputed generation
+python3 benchmarks/twin_speed.py                           # numpy against PyTorch, step and generation speed
+python3 benchmarks/twin_trajectory.py                      # how long the two engines stay together
 ```
 
 ## Tests
 
 ```bash
 pip install pytest
-pytest -q          # 140 tests, about 12 seconds
+pytest -q          # 140 tests in about 12 seconds; 190 in about 30 with PyTorch installed
 ```
 
 They cover the MITSU formula against its definition; every backward pass against finite
 differences; rotary positions, tied embeddings and the generation cache; the tokenizer's
 lossless round trip; chunked encoding against whole-text encoding; the optimisers; exact
 resume; the command line end to end; and learning itself, including 48-layer networks and
-language models that memorise and regenerate a sequence.
+language models that memorise and regenerate a sequence. With PyTorch installed, 50 more
+tests check the twin against the engine; without it they are skipped. One of them uses the
+`mitsu_torch` package from the main MITSU repository and is skipped if that is not installed.
 
 ## Limits
 
-- CPU and numpy only. No GPU, no convolutions, no automatic differentiation. Stage 2 of the
-  language-model plan is a PyTorch twin of `MitsuLM` that loads the same weights and must
-  produce the same outputs; this engine is the reference it will be checked against.
+- The engine itself is CPU and numpy only: no convolutions, no automatic differentiation.
+  The GPU path is the PyTorch twin, which covers `MitsuLM` only, runs on one device, and has
+  been tested on a CPU but not yet run on a GPU.
 - Very deep MitsuGLU stacks are sensitive to the learning rate: 128 blocks trained at
   1e-3 and failed at 2e-3. Keep it at or below 1e-3 with warm-up and gradient clipping.
 - The tokenizer is pure Python. Encoding runs at about 4 MB of text per second and training

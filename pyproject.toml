@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mitsu-engine"
-version = "0.2.0"
-description = "A numpy-only neural-network and language-model engine built around the MITSU activation"
+version = "0.3.0"
+description = "A neural-network and language-model engine built around the MITSU activation: a numpy reference and a verified PyTorch twin"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Evan David Little" }]
 dependencies = ["numpy>=1.24"]
-keywords = ["neural-network", "activation-function", "numpy", "deep-learning", "transformer", "language-model", "tokenizer"]
+keywords = ["neural-network", "activation-function", "numpy", "pytorch", "deep-learning", "transformer", "language-model", "tokenizer"]
 classifiers = ["Programming Language :: Python :: 3", "Topic :: Scientific/Engineering :: Artificial Intelligence"]
 
 [project.scripts]
@@ -20,9 +20,10 @@ mitsu-engine = "mitsu_engine.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+torch = ["torch>=2.3"]
 
 [tool.setuptools]
-packages = ["mitsu_engine"]
+packages = ["mitsu_engine", "mitsu_engine.twin"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.0 — language-model stage 2: the PyTorch twin
+
+`mitsu_engine.twin`: the same language model in PyTorch, tested to reproduce the numpy
+engine. PyTorch is optional (`pip install ".[torch]"`); the core still needs numpy only and
+never imports it.
+
+- **`twin.TorchMitsuLM`.** `MitsuLM` with PyTorch modules: the same `LMConfig`, parameter
+  names, generation procedure and checkpoint file. `from_engine`, `to_engine`, `save`, `load`.
+  Its initial weights are drawn by the numpy engine, so the same seed gives both engines
+  the same start.
+- **Parity tests.** With identical weights, the logits, the loss, every gradient (numpy's
+  hand-written backward against autograd) and the cached generation path agree to about
+  1e-14 in float64 and 1e-5 in float32, and generated tokens are identical for greedy,
+  temperature, top-k and top-p sampling.
+- **The same training run.** `twin.EngineAdamW` and `twin.clip_grad_norm` reproduce the
+  engine's update rules; `twin.TorchTrainer` is the engine's `Trainer` with the optimisation
+  step replaced. In float64, 30 steps leave the two engines with the same weights to 7e-15.
+- **One state format.** Models and training states written by either engine load in the
+  other; a run can change engine midway.
+- **Mixed precision.** `amp="bf16"` and `amp="fp16"` (with a gradient scaler). MITSU, RMSNorm
+  and the position rotation compute in float32 under autocast.
+- **Command line.** `train` and `generate` take `--backend torch --device ... --amp ...`;
+  the new `parity` command measures the twin against the engine on a given device and exits
+  with 0 or 1.
+- **`write_checkpoint` / `read_checkpoint`.** The checkpoint layout now lives in these two
+  functions, used by both engines.
+- 50 new tests (190 with PyTorch installed; 140 without, the rest skipped), an example,
+  two benchmarks, `docs/TWIN.md`, and a second CI job that installs PyTorch.
+
+Not done: nothing in this release has been run on a GPU. `python -m mitsu_engine parity
+--device cuda` is the check to run first on one.
+
 ## 0.2.0 — language-model stage 1
 
 Everything needed to define, train and sample from a sub-word language model in numpy.
