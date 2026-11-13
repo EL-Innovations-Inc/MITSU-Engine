@@ -24,3 +24,9 @@ def load_checkpoint(path, model, optimizer=None, strict=True):
             if state:
                 optimizer.load_state_dict(state)
         return json.loads(str(z["meta"]))
+
+
+def read_meta(path):
+    """The metadata dict of a checkpoint, without loading any weights."""
+    with np.load(path if path.endswith(".npz") else path + ".npz", allow_pickle=False) as z:
+        return json.loads(str(z["meta"]))
