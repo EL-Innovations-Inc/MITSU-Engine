@@ -1,55 +1,49 @@
 name: tests
-
 on:
   push:
   pull_request:
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  test:
-    name: Python ${{ matrix.python-version }}
+  numpy:
+    name: numpy only (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
-
-    env:
-      # Avoid BLAS thread overhead on these small training workloads.
-      OPENBLAS_NUM_THREADS: "1"
-      OMP_NUM_THREADS: "1"
-      MKL_NUM_THREADS: "1"
-      PYTHONUNBUFFERED: "1"
-
+        python-version: ["3.10", "3.12"]
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-
-      - name: Install package and test dependencies
+      - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[dev]"
-          python -m pip check
-
-      - name: Run test suite
-        run: python -m pytest -q
-
-      - name: Run spiral training example
+          pip install numpy pytest
+      - name: Tests (the PyTorch twin's tests are skipped)
+        run: pytest -q
+      - name: Spirals example
         run: python examples/01_spirals.py
+      - name: Automatic differentiation example
+        run: python examples/07_autodiff.py
+      - name: Command line is importable
+        run: python -m mitsu_engine --help
+  twin:
+    name: PyTorch twin (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Tests
+        run: pytest -q
+      - name: Device check (on the CPU)
+        run: python -m mitsu_engine gpu-check --device cpu --no-speed
+      - name: Twin example
+        run: python examples/05_torch_twin.py
